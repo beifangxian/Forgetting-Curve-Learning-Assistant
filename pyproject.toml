@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "遗忘曲线复习 —— 本地优先的间隔重复学习记忆工具（基于 SM-2 遗忘曲线）"
 readme = "README.md"
 requires-python = ">=3.8"
+license = "GPL-3.0-only"
 
 [project.scripts]
 mnemosyne = "mnemosyne_pipx.cli:main"
