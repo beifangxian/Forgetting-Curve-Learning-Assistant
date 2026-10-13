@@ -3,7 +3,6 @@ name = "Mnemosyne_pipx"
 version = "0.1.0"
 description = "遗忘曲线复习 —— 本地优先的间隔重复学习记忆工具（基于 SM-2 遗忘曲线）"
 readme = "README.md"
-authors = [ { name = "user" } ]
 requires-python = ">=3.8"
 
 [project.scripts]

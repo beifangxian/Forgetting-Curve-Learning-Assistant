@@ -4,9 +4,10 @@ from datetime import datetime, date
 import os
 import json
 import shutil
+from .paths import get_data_dir
 
-DEFAULT_DB = os.path.join('D:\\bfx\\Mnemosyne_data', 'mnemosyne.db')
-DEFAULT_FILE_DIR = os.path.join('D:\\bfx\\Mnemosyne_data', 'files')
+DEFAULT_DB = os.path.join(get_data_dir(), 'mnemosyne.db')
+DEFAULT_FILE_DIR = os.path.join(get_data_dir(), 'files')
 
 
 def _from_json(s: Optional[str]) -> List:
@@ -25,7 +26,7 @@ def init_db(path: Optional[str] = None):
         path = DEFAULT_DB
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # 兼容旧版本：将 images 目录重命名为 files 目录
-    old_dir = os.path.join('D:\\bfx\\Mnemosyne_data', 'images')
+    old_dir = os.path.join(get_data_dir(), 'images')
     if os.path.isdir(old_dir) and not os.path.isdir(DEFAULT_FILE_DIR):
         try:
             os.rename(old_dir, DEFAULT_FILE_DIR)
@@ -70,7 +71,20 @@ def init_db(path: Optional[str] = None):
         difficulty TEXT DEFAULT 'normal',
         study_hours_per_day REAL DEFAULT 1.0,
         notes TEXT,
+        skills TEXT,
         updated_at TEXT
+    )
+    ''')
+    # 兼容旧版本：为 profiles 表补充 skills 列
+    pcols = [row[1] for row in c.execute('PRAGMA table_info(profiles)').fetchall()]
+    if 'skills' not in pcols:
+        c.execute('ALTER TABLE profiles ADD COLUMN skills TEXT')
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS interview_log (
+        id INTEGER PRIMARY KEY,
+        question TEXT,
+        topic TEXT,
+        created_at TEXT
     )
     ''')
     conn.commit()
@@ -78,13 +92,13 @@ def init_db(path: Optional[str] = None):
     return path
 
 
-def set_profile(name: str, difficulty: str = 'normal', study_hours_per_day: float = 1.0, notes: Optional[str] = None, db_path: Optional[str] = None):
+def set_profile(name: str, difficulty: str = 'normal', study_hours_per_day: float = 1.0, notes: Optional[str] = None, skills: Optional[str] = None, db_path: Optional[str] = None):
     if db_path is None:
         db_path = DEFAULT_DB
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     now = datetime.utcnow().isoformat()
-    cur.execute('INSERT INTO profiles (name,difficulty,study_hours_per_day,notes,updated_at) VALUES (?,?,?,?,?)', (name, difficulty, study_hours_per_day, notes, now))
+    cur.execute('INSERT INTO profiles (name,difficulty,study_hours_per_day,notes,skills,updated_at) VALUES (?,?,?,?,?,?)', (name, difficulty, study_hours_per_day, notes, skills, now))
     conn.commit()
     conn.close()
 
@@ -94,12 +108,12 @@ def get_profile(db_path: Optional[str] = None):
         db_path = DEFAULT_DB
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute('SELECT id,name,difficulty,study_hours_per_day,notes,updated_at FROM profiles ORDER BY id DESC LIMIT 1')
+    cur.execute('SELECT id,name,difficulty,study_hours_per_day,notes,skills,updated_at FROM profiles ORDER BY id DESC LIMIT 1')
     r = cur.fetchone()
     conn.close()
     if not r:
         return None
-    return {'id': r[0], 'name': r[1], 'difficulty': r[2], 'study_hours_per_day': r[3], 'notes': r[4], 'updated_at': r[5]}
+    return {'id': r[0], 'name': r[1], 'difficulty': r[2], 'study_hours_per_day': r[3], 'notes': r[4], 'skills': r[5], 'updated_at': r[6]}
 
 
 def get_stats(db_path: Optional[str] = None):
@@ -292,6 +306,58 @@ def update_card_schedule(card_id: int, ease: float, interval: int, repetition: i
     cur.execute('UPDATE cards SET ease=?,interval=?,repetition=?,next_review=?,updated_at=? WHERE id=?', (ease, interval, repetition, next_review, datetime.utcnow().isoformat(), card_id))
     conn.commit()
     conn.close()
+
+
+def mark_cards_due(card_ids: List[int], db_path: Optional[str] = None) -> int:
+    """把指定卡片标记为今日到期，用于面试薄弱点强化训练。
+
+    将 next_review 设为今天、interval 与 repetition 归零，
+    使其出现在下一次 `review` 的到期队列里。返回成功标记的卡片数。
+    """
+    if not card_ids:
+        return 0
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    today = date.today().isoformat()
+    now = datetime.utcnow().isoformat()
+    count = 0
+    for cid in card_ids:
+        cur.execute('UPDATE cards SET next_review=?, interval=0, repetition=0, updated_at=? WHERE id=?', (today, now, cid))
+        count += cur.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+
+def record_interview_questions(questions: List[str], topic: str, db_path: Optional[str] = None):
+    """记录一次面试问过的题目，用于跨次面试去重。"""
+    if not questions:
+        return
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    for q in questions:
+        if q and q.strip():
+            cur.execute('INSERT INTO interview_log (question, topic, created_at) VALUES (?,?,?)', (q.strip(), topic, now))
+    conn.commit()
+    conn.close()
+
+
+def get_recent_interview_questions(limit: int = 60, db_path: Optional[str] = None) -> List[str]:
+    """读取最近面试问过的题目（去重、按最近优先），用于出题时避免重复。"""
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute('SELECT question FROM interview_log ORDER BY id DESC LIMIT ?', (limit * 2,))
+    rows = cur.fetchall()
+    conn.close()
+    seen = []
+    for r in rows:
+        q = (r[0] or '').strip()
+        if q and q not in seen:
+            seen.append(q)
+        if len(seen) >= limit:
+            break
+    return seen
 
 
 def record_review(card_id: int, quality: int, feynman: Optional[str] = None, db_path: Optional[str] = None):

@@ -1,6 +1,7 @@
 import argparse
 import json
-from . import db, scheduler, llm, notes
+import os
+from . import db, scheduler, llm, notes, interview
 from datetime import date
 import sys
 
@@ -114,8 +115,10 @@ def review_cmd(args):
     if not rows:
         print('No cards due today.')
         return
+    total = len(rows)
     use_llm = (not args.no_llm) and llm.is_configured()
     profile = db.get_profile(args.db)
+    print('\n=== 开始复习：共 {0} 题 ==='.format(total))
 
     def run_choice(question, answer):
         """选择题轮次：AI 出单选题并判对错。返回 quality，失败返回 None。"""
@@ -181,9 +184,11 @@ def review_cmd(args):
                 break
             print('请输入 1 或 2')
 
-    for r in rows:
+    for index, r in enumerate(rows, start=1):
         card_id, question, answer, examples, files, tags, created_at, updated_at, ease, interval, repetition, next_review = r
         print('\n' + '=' * 50)
+        remaining = total - index
+        print('[复习进度] {0}/{1}，已完成 {2}，剩余 {3}'.format(index, total, index, remaining))
         quality = None
 
         if use_llm:
@@ -225,6 +230,132 @@ def review_cmd(args):
         print('已更新：下次复习 {0}'.format(next_rev))
 
 
+def interview_cmd(args):
+    db.init_db(args.db)
+    if not llm.is_configured():
+        print('错误：面试功能需要配置 LLM。请设置 MNEMOSYNE_LLM_API_KEY 或写入 config.json。')
+        return 1
+    topic = args.topic or 'mix'
+    num = args.num or 6
+
+    context = interview.collect_project_context(args.project_root)
+    if not context.strip():
+        print('错误：未读取到项目源码，无法进行项目面试。')
+        return 1
+
+    scope = {'c': 'C 语言', 'stm32': '嵌入式软件', 'mix': '项目源码与相关技术'}.get(topic, topic)
+    print('\n=== AI 模拟面试（{0} 题，由易到难）==='.format(num))
+    print('面试范围：' + scope)
+    print('项目目录：' + os.path.abspath(args.project_root or os.environ.get('MNEMOSYNE_PROJECT_ROOT') or os.getcwd()))
+    print('每道题请直接作答，答完由面试官点评并进入下一题。\n')
+
+    # 跨次去重：读取历史面试问过的题，避免热门题反复出现
+    past_questions = db.get_recent_interview_questions(db_path=args.db)
+
+    # 读取候选人技能画像（用于面试出题围绕简历技能、按熟练度定难度）
+    skills = None
+    profile = db.get_profile(args.db)
+    if profile and profile.get('skills'):
+        skills = str(profile.get('skills')).strip()
+
+    history = []
+    asked_this_round = []
+    for i in range(1, num + 1):
+        history_text = interview.format_history(history)
+        # 本次已问过的题也要纳入去重
+        avoid = list(past_questions) + asked_this_round
+        try:
+            q = llm.generate_interview_question(context, history_text, topic, i, num, avoid, skills)
+        except Exception as e:
+            print('[面试官出题失败] ' + str(e))
+            break
+        if not q:
+            print('[面试官出题失败] 请稍后重试。')
+            break
+        asked_this_round.append(q['question'])
+
+        diff_label = {'easy': '基础', 'medium': '进阶', 'hard': '深入'}.get(q.get('difficulty'), '')
+        print('\n[第 {0}/{1} 题]{2}'.format(i, num, ('（' + diff_label + '）') if diff_label else ''))
+        print(q['question'])
+        user_answer = input('你的回答：').strip()
+        if not user_answer:
+            user_answer = '（未作答）'
+
+        score, feedback = None, None
+        try:
+            score, feedback = llm.evaluate_interview_answer(q['question'], q.get('reference', ''), user_answer)
+        except Exception as e:
+            print('[点评失败] ' + str(e))
+        if score is None:
+            score = 0
+        print('面试官点评（{0}/5）：{1}'.format(score, feedback or ''))
+
+        history.append({
+            'question': q['question'],
+            'reference': q.get('reference', ''),
+            'user_answer': user_answer,
+            'score': score,
+            'feedback': feedback or '',
+        })
+
+    if not history:
+        print('本次面试未产生任何问答。')
+        return 1
+
+    # 记录本次问过的题，供下次面试去重
+    db.record_interview_questions(asked_this_round, topic, args.db)
+
+    print('\n正在生成面试评价报告...')
+    try:
+        report = llm.generate_interview_report(interview.format_history(history))
+    except Exception as e:
+        print('[生成报告失败] ' + str(e))
+        report = None
+
+    if report:
+        print('\n' + '=' * 50)
+        print('面试评价报告')
+        print('=' * 50)
+        print('总分：{0}/100'.format(report.get('total_score', '-')))
+        print('总评：' + str(report.get('summary', '')))
+        strengths = report.get('strengths') or []
+        if strengths:
+            print('\n【强项】')
+            for s in strengths:
+                print('  + ' + str(s))
+        weaknesses = report.get('weaknesses') or []
+        if weaknesses:
+            print('\n【薄弱点】')
+            for w in weaknesses:
+                if isinstance(w, dict):
+                    print('  - ' + str(w.get('topic', '')))
+                else:
+                    print('  - ' + str(w))
+        print('\n【建议】' + str(report.get('suggestion', '')))
+
+        # 把薄弱点匹配到复习卡库中已有的卡片，标记为今日到期，强化训练
+        weaknesses = report.get('weaknesses') or []
+        weaknesses = [w for w in weaknesses if isinstance(w, dict) and str(w.get('question') or '').strip()]
+        if weaknesses:
+            existing = db.list_cards(args.db)
+            if existing:
+                print('\n正在将薄弱点匹配到已有复习卡...')
+                matched = llm.match_weaknesses_to_cards(weaknesses, existing)
+                matched_ids = list(dict.fromkeys([cid for cid in matched if cid is not None]))
+                if matched_ids:
+                    n = db.mark_cards_due(matched_ids, args.db)
+                    print('已将 {0} 张相关复习卡标记为今日到期，`mnemosyne review` 会调出这些卡片做强化训练。'.format(n))
+                unmatched = sum(1 for cid in matched if cid is None)
+                if unmatched:
+                    print('另有 {0} 个薄弱点在复习卡库中未找到对应卡片，已跳过。'.format(unmatched))
+            else:
+                print('\n复习卡库为空，无法匹配薄弱点进行强化。')
+    else:
+        print('\n（未能生成报告，但面试过程已结束。）')
+
+    return 0
+
+
 def export_cmd(args):
     db.init_db(args.db)
     out = args.out or 'mnemosyne_export.json'
@@ -254,7 +385,7 @@ def show_cmd(args):
 
 def profile_set_cmd(args):
     db.init_db(args.db)
-    db.set_profile(args.name, args.difficulty, args.study_hours, args.notes, args.db)
+    db.set_profile(args.name, args.difficulty, args.study_hours, args.notes, args.skills, args.db)
     print('Profile set: name={0} difficulty={1} study_hours={2}'.format(args.name, args.difficulty, args.study_hours))
 
 
@@ -270,6 +401,11 @@ def profile_show_cmd(args):
     print('  difficulty: {0}'.format(p.get('difficulty')))
     print('  study_hours_per_day: {0}'.format(p.get('study_hours_per_day')))
     print('  notes: {0}'.format(p.get('notes')))
+    if p.get('skills'):
+        print('  skills:')
+        for line in str(p.get('skills')).splitlines():
+            if line.strip():
+                print('    ' + line.strip())
     print('  updated_at: {0}'.format(p.get('updated_at')))
     s = db.get_stats(args.db)
     print('\n学习统计：')
@@ -317,6 +453,13 @@ def build_parser():
     p_review.add_argument('--type', choices=['choice', 'fill'], help='question type: choice / fill (default: interactive selection)')
     p_review.set_defaults(func=review_cmd)
 
+    p_interview = sp.add_parser('interview')
+    p_interview.add_argument('--num', type=int, default=6, help='面试题数（默认 6）')
+    p_interview.add_argument('--topic', choices=['c', 'stm32', 'mix'], default='mix', help='面试范围（默认 mix）')
+    p_interview.add_argument('--project-root', help='源码目录；也可设置 MNEMOSYNE_PROJECT_ROOT')
+    p_interview.add_argument('--db')
+    p_interview.set_defaults(func=interview_cmd)
+
     p_export = sp.add_parser('export')
     p_export.add_argument('--db')
     p_export.add_argument('--out')
@@ -334,6 +477,7 @@ def build_parser():
     p_profile_set.add_argument('--difficulty', choices=['easy','normal','hard'], default='normal')
     p_profile_set.add_argument('--study-hours', type=float, default=1.0)
     p_profile_set.add_argument('--notes')
+    p_profile_set.add_argument('--skills', help='技能画像，多行/分号分隔，可标注熟练度（用于面试出题）')
     p_profile_set.add_argument('--db')
     p_profile_set.set_defaults(func=profile_set_cmd)
 

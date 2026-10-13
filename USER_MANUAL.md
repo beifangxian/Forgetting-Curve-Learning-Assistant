@@ -45,7 +45,7 @@ python -m mnemosyne_pipx review
 
 ### 方式 A：模块入口（推荐）
 
-在项目目录 `D:\bfx\Mnemosyne\Mnemosyne_pipx` 下：
+在项目目录下：
 
 ```powershell
 $env:PYTHONPATH = "src"
@@ -55,10 +55,8 @@ python -m mnemosyne_pipx --help
 ### 方式 B：pipx 安装后的命令
 
 ```powershell
-$env:PIPX_HOME = "D:\bfx\Mnemosyne\pipx"
-$env:PIPX_BIN_DIR = "D:\bfx\Mnemosyne\bin"
-python -m pipx install --editable D:\bfx\Mnemosyne\Mnemosyne_pipx --force
-$env:Path = "$env:PIPX_BIN_DIR;" + $env:Path
+python -m pip install --user pipx
+python -m pipx install --editable .
 mnemosyne --help
 ```
 
@@ -128,6 +126,8 @@ mnemosyne add --topic "Python 装饰器"
 mnemosyne review [--type choice|fill] [--feynman] [--no-llm]
 ```
 
+- 开始复习时会先显示今日待复习总数，例如 `共 50 题`
+- 每答完一题，会更新进度显示为 `当前进度：1/50`，并在后续逐步减少剩余题数
 - 默认：如果配置了 LLM，AI 出题 → 你作答 → AI 判分并给反馈 → 显示参考答案
 - `--no-llm`：强制本地模式（显示问题 → 回车看答案 → 自评 0-5）
 - `--feynman`：复习结束后提示你用一句话复述（费曼式），记录到复习历史
@@ -147,6 +147,34 @@ mnemosyne review [--type choice|fill] [--feynman] [--no-llm]
 > 仅在 AI 模式且答错时出现；本地模式无此提示。
 
 评分 0-5 会驱动 SM-2 调度，更新下次复习时间。
+
+### interview —— AI 模拟面试（项目考核）
+
+让 AI 基于你选择的项目源码出题，由易到难考察项目掌握程度。
+
+```powershell
+mnemosyne interview [--num 6] [--topic c|stm32|mix] [--project-root 路径]
+```
+
+- `--num`：面试题数，默认 6
+- `--topic`：面试范围
+  - `c`：偏重 C 语言
+  - `stm32`：偏重嵌入式软件
+  - `mix`：项目源码涉及的综合技术（默认）
+- `--project-root`：项目源码目录；默认当前工作目录，也可设置 `MNEMOSYNE_PROJECT_ROOT`
+
+流程：
+
+1. 面试官读取所选项目目录中的源码
+2. 逐题提问，难度由易到难；你作答后，面试官判分（0-5）并点评
+3. 面试结束输出**评价报告**：总分、总评、强项、薄弱点、学习建议
+4. 自动把薄弱点**匹配到复习卡库中已有的卡片**，并标记为今日到期
+
+之后运行 `mnemosyne review`，这些薄弱点对应的卡片会被调出，做**强化训练**。
+
+> 面试需配置 LLM。未配置时提示错误并退出。
+>
+> 启用 LLM 后，所读取的源码和面试回答会发送给配置的服务商。请勿选择包含密钥或其他敏感信息的目录。
 
 ### list / show —— 查看
 
@@ -189,7 +217,7 @@ $env:MNEMOSYNE_LLM_MODEL = "deepseek-chat"
 
 ### 方法二：配置文件
 
-创建 `D:\bfx\Mnemosyne_data\config.json`：
+在数据目录中创建 `config.json`。Windows 默认目录为 `%LOCALAPPDATA%\mnemosyne`；macOS/Linux 默认目录为 `$XDG_DATA_HOME/mnemosyne`（未设置时为 `~/.local/share/mnemosyne`）。也可通过 `MNEMOSYNE_DATA_DIR` 指定数据目录：
 
 ```json
 {"api_key": "你的key", "api_url": "https://api.deepseek.com/v1/chat/completions", "model": "deepseek-chat"}
@@ -203,8 +231,10 @@ $env:MNEMOSYNE_LLM_MODEL = "deepseek-chat"
 
 | 项 | 路径 |
 |----|------|
-| 数据库 | `D:\bfx\Mnemosyne_data\mnemosyne.db` |
-| 附件目录 | `D:\bfx\Mnemosyne_data\files` |
+| 数据库 | `<数据目录>/mnemosyne.db` |
+| 附件目录 | `<数据目录>/files` |
+
+Windows 默认数据目录：`%LOCALAPPDATA%\mnemosyne`。macOS/Linux 默认数据目录：`$XDG_DATA_HOME/mnemosyne`；未设置 `XDG_DATA_HOME` 时使用 `~/.local/share/mnemosyne`。
 
 ## 故障排查
 
