@@ -2,21 +2,31 @@
 
 配置优先级：环境变量 > 配置文件（D:\\bfx\\Mnemosyne_data\\config.json）。
 
-配置文件支持两种写法（平铺或包一层 llm）：
+配置文件支持三种写法：
+1. 单模型（平铺）：
     {"api_key": "...", "api_url": "...", "model": "..."}
+2. 包一层 llm：
     {"llm": {"api_key": "...", "api_url": "...", "model": "..."}}
+3. 多模型故障切换（推荐）：
+    {"providers": [
+        {"name": "deepseek", "api_key": "...", "api_url": "...", "model": "deepseek-chat"},
+        {"name": "glm", "api_key": "...", "api_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions", "model": "glm-4-flash"}
+    ]}
+    providers 按顺序尝试，主服务崩溃时自动切换到下一个可用服务。
 
 环境变量：
     MNEMOSYNE_LLM_API_KEY
     MNEMOSYNE_LLM_API_URL
     MNEMOSYNE_LLM_MODEL
 
-未配置 API key 时 is_configured() 返回 False，复习会退回本地交互模式。
+未配置任何 API key 时 is_configured() 返回 False，复习会退回本地交互模式。
 """
 import os
 import json
 import re
+import time
 import urllib.request
+import urllib.error
 from typing import List, Optional, Tuple, Dict, Any
 from .paths import get_data_dir
 
@@ -42,7 +52,7 @@ def load_config() -> Dict[str, Any]:
                 if isinstance(llm_section, dict):
                     cfg.update(llm_section)
                 else:
-                    for k in ('api_key', 'api_url', 'model'):
+                    for k in ('api_key', 'api_url', 'model', 'providers'):
                         if k in data:
                             cfg[k] = data[k]
     except Exception:
@@ -54,44 +64,119 @@ def load_config() -> Dict[str, Any]:
     return cfg
 
 
+def _default_provider_name(url: str, model: str) -> str:
+    """根据 api_url 推断一个可读的 provider 名，用于切换提示。"""
+    u = (url or '').lower()
+    if 'deepseek' in u:
+        return 'deepseek'
+    if 'bigmodel' in u or 'zhipu' in u:
+        return 'glm'
+    if 'dashscope' in u or 'aliyun' in u:
+        return 'qwen'
+    if 'siliconflow' in u:
+        return 'siliconflow'
+    return model or 'llm'
+
+
+def get_providers() -> List[Dict[str, str]]:
+    """规范化配置为 provider 列表（按配置顺序，供故障切换）。"""
+    cfg = load_config()
+    providers = cfg.get('providers')
+    if isinstance(providers, list):
+        result = []
+        for p in providers:
+            if isinstance(p, dict) and p.get('api_key'):
+                api_url = p.get('api_url') or DEFAULT_API_URL
+                model = p.get('model') or DEFAULT_MODEL
+                name = str(p.get('name') or '') or _default_provider_name(api_url, model)
+                result.append({'api_key': str(p['api_key']), 'api_url': api_url, 'model': model, 'name': name})
+        if result:
+            return result
+    key = cfg.get('api_key')
+    if key:
+        api_url = cfg.get('api_url') or DEFAULT_API_URL
+        model = cfg.get('model') or DEFAULT_MODEL
+        return [{'api_key': str(key), 'api_url': api_url, 'model': model, 'name': _default_provider_name(api_url, model)}]
+    return []
+
+
 def is_configured() -> bool:
-    return bool(load_config().get('api_key'))
+    return bool(get_providers())
+
+
+_active_provider = None
+
+
+def _note_provider(name: str):
+    """在 provider 发生切换时提示一次（避免刷屏）。"""
+    global _active_provider
+    label = name or 'llm'
+    if label != _active_provider:
+        _active_provider = label
+        print('[LLM] 当前模型服务：{0}'.format(label))
 
 
 def chat(messages: List[Dict[str, str]], max_tokens: int = 256, temperature: float = 0.7) -> str:
-    """调用 OpenAI 兼容的 chat completions 接口，返回助手文本。"""
-    cfg = load_config()
-    api_key = cfg.get('api_key')
-    if not api_key:
+    """调用 OpenAI 兼容的 chat completions 接口，返回助手文本。
+
+    依次尝试多个 provider（按配置顺序），主 provider 失败自动切换到备用。
+    对临时性错误（429/5xx/网络中断）每个 provider 内部再自动重试，最多 3 次。
+    """
+    providers = get_providers()
+    if not providers:
         raise RuntimeError('LLM 未配置：请设置 MNEMOSYNE_LLM_API_KEY 或写入 config.json')
-    api_url = cfg.get('api_url') or DEFAULT_API_URL
-    model = cfg.get('model') or DEFAULT_MODEL
+    last_error = None
+    for provider in providers:
+        api_key = provider['api_key']
+        api_url = provider.get('api_url') or DEFAULT_API_URL
+        model = provider.get('model') or DEFAULT_MODEL
+        name = provider.get('name') or ''
+        for attempt in range(3):
+            payload = {
+                'model': model,
+                'messages': messages,
+                'max_tokens': max_tokens,
+                'temperature': temperature,
+                'stream': False,
+            }
+            req = urllib.request.Request(
+                api_url,
+                data=json.dumps(payload).encode('utf-8'),
+                headers={
+                    'Authorization': 'Bearer ' + api_key,
+                    'Content-Type': 'application/json',
+                },
+                method='POST',
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+            except urllib.error.HTTPError as e:
+                # 限流或服务暂时不可用：退避后重试
+                if e.code in (429, 500, 502, 503, 504) and attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                last_error = e
+                break
+            except urllib.error.URLError as e:
+                # 网络中断：退避后重试
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                last_error = e
+                break
 
-    payload = {
-        'model': model,
-        'messages': messages,
-        'max_tokens': max_tokens,
-        'temperature': temperature,
-        'stream': False,
-    }
-    req = urllib.request.Request(
-        api_url,
-        data=json.dumps(payload).encode('utf-8'),
-        headers={
-            'Authorization': 'Bearer ' + api_key,
-            'Content-Type': 'application/json',
-        },
-        method='POST',
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
+            choices = data.get('choices') or []
+            if choices:
+                msg = choices[0].get('message') or {}
+                content = msg.get('content')
+                if content:
+                    _note_provider(name)
+                    return content
+            return ''
 
-    choices = data.get('choices') or []
-    if choices:
-        msg = choices[0].get('message') or {}
-        content = msg.get('content')
-        if content:
-            return content
+    if last_error is not None:
+        raise last_error
     return ''
 
 
@@ -105,17 +190,69 @@ def generate_question(question: str) -> str:
     return q or question
 
 
-def generate_choice_question(question: str, answer: str) -> Optional[Dict[str, Any]]:
-    """根据知识点生成一道单选题。
+def _weakness_prompt_block(weakness_tags: Optional[List[str]], weakness_history: Optional[List[Dict[str, Any]]]) -> str:
+    """构造「薄弱点强化」出题提示块；无薄弱点时返回空串。"""
+    tags = [str(t).strip() for t in (weakness_tags or []) if str(t).strip()]
+    if not tags:
+        return ''
+    lines = []
+    for h in (weakness_history or [])[:10]:
+        tag = str(h.get('tag') or '').strip()
+        q = str(h.get('question') or '').strip()
+        if q:
+            lines.append('- [{0}][{1}] {2}'.format(tag, h.get('qtype') or '题', q))
+    return (
+        '\n【薄弱点强化】考生当前薄弱的知识点标签：' + '、'.join(tags) + '。\n'
+        '出题时，如果当前知识点能与上述某个薄弱点自然关联，请出一题“结合薄弱点”的综合题（例：薄弱点是 I2C、当前复习 SPI，可问“I2C 与 SPI 的区别”）；若关联牵强就不要强行结合，正常出当前知识点的题即可。\n'
+        '这些薄弱点最近已出过的题（务必避免重复、换新角度）：\n' + ('\n'.join(lines) if lines else '（暂无）') + '\n'
+    )
 
-    返回 {'question': str, 'options': [str, ...], 'correct': str(字母 A/B/C/D)}；
+
+def extract_weakness_tags(wrong_items: List[Dict[str, Any]]) -> List[str]:
+    """从答错的题中提炼薄弱知识点标签列表（简短关键词）。"""
+    if not wrong_items:
+        return []
+    lines = []
+    for i, w in enumerate(wrong_items, start=1):
+        lines.append('{0}. 题目：{1}'.format(i, str(w.get('question') or '').strip()))
+        lines.append('   参考答案：{0}'.format(str(w.get('answer') or '').strip()))
+    content = chat([
+        {'role': 'system', 'content': '你是一名学习教练，负责从答错题目中提炼薄弱知识点标签。'},
+        {'role': 'user', 'content': (
+            '下面是一些答错的复习题。请提炼出考生薄弱的「知识点标签」（简短关键词，如 I2C 时序、volatile、DMA 中断、指针运算）。\n'
+            '要求：每个标签 2-8 个字，只提炼最核心、最具体的知识点；语义重复的合并；最多 5 个。\n'
+            '严格只输出 JSON，格式：{"tags": ["标签1", "标签2"]}\n\n'
+            '=== 答错题目 ===\n' + '\n'.join(lines)
+        )},
+    ], max_tokens=128, temperature=0.3)
+
+    if not content:
+        return []
+    try:
+        m = re.search(r'\{.*\}', content, re.S)
+        obj = json.loads(m.group(0)) if m else json.loads(content)
+        tags = obj.get('tags') or []
+        if isinstance(tags, list):
+            return [str(t).strip() for t in tags if str(t).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def generate_choice_question(question: str, answer: str, weakness_tags: Optional[List[str]] = None, weakness_history: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    """根据知识点生成一道单选题，可结合薄弱点强化。
+
+    返回 {'question': str, 'options': [str, ...], 'correct': str(字母 A/B/C/D),
+          'weakness_tag': Optional[str]（若结合了某薄弱点则返回该标签）}；
     失败返回 None。
     """
+    weakness_block = _weakness_prompt_block(weakness_tags, weakness_history)
     content = chat([
         {'role': 'system', 'content': '你是一名学习教练，负责出单选题。'},
         {'role': 'user', 'content': (
             '根据下面的知识点出一道单选题，给出 4 个选项（A/B/C/D），其中只有一个是正确答案。\n'
-            '严格只输出 JSON，格式：{"question": "<题目>", "options": ["<选项A>", "<选项B>", "<选项C>", "<选项D>"], "correct": "<正确选项字母 A/B/C/D>"}\n\n'
+            '严格只输出 JSON，格式：{"question": "<题目>", "options": ["<选项A>", "<选项B>", "<选项C>", "<选项D>"], "correct": "<正确选项字母 A/B/C/D>", "weakness_tag": "<结合的薄弱点标签，未结合填 null>"}\n'
+            + weakness_block +
             '知识点：' + question + '\n'
             '参考答案：' + answer
         )},
@@ -136,22 +273,27 @@ def generate_choice_question(question: str, answer: str) -> Optional[Dict[str, A
         if cm:
             correct = cm.group(0)
         if q and len(options) >= 2 and correct:
-            return {'question': q, 'options': options, 'correct': correct}
+            wt = obj.get('weakness_tag')
+            weakness_tag = str(wt).strip() if (isinstance(wt, str) and wt.strip().lower() not in ('', 'null', 'none')) else None
+            return {'question': q, 'options': options, 'correct': correct, 'weakness_tag': weakness_tag}
     except Exception:
         pass
     return None
 
 
-def generate_fill_blank_question(question: str, answer: str) -> Optional[Dict[str, str]]:
-    """根据知识点生成一道填空题。
+def generate_fill_blank_question(question: str, answer: str, weakness_tags: Optional[List[str]] = None, weakness_history: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, str]]:
+    """根据知识点生成一道填空题，可结合薄弱点强化。
 
-    返回 {'question': str(含 ____ 挖空), 'answer': str(正确答案)}；失败返回 None。
+    返回 {'question': str(含 ____ 挖空), 'answer': str(正确答案),
+          'weakness_tag': Optional[str]}；失败返回 None。
     """
+    weakness_block = _weakness_prompt_block(weakness_tags, weakness_history)
     content = chat([
         {'role': 'system', 'content': '你是一名学习教练，负责出填空题。'},
         {'role': 'user', 'content': (
             '根据下面的知识点出一道填空题，把关键信息挖空（用 ____ 表示空位），并给出正确答案。\n'
-            '严格只输出 JSON，格式：{"question": "<含 ____ 的题目>", "answer": "<正确答案>"}\n\n'
+            '严格只输出 JSON，格式：{"question": "<含 ____ 的题目>", "answer": "<正确答案>", "weakness_tag": "<结合的薄弱点标签，未结合填 null>"}\n'
+            + weakness_block +
             '知识点：' + question + '\n'
             '参考答案：' + answer
         )},
@@ -165,23 +307,29 @@ def generate_fill_blank_question(question: str, answer: str) -> Optional[Dict[st
         q = str(obj.get('question') or '').strip()
         a = str(obj.get('answer') or '').strip()
         if q and a:
-            return {'question': q, 'answer': a}
+            wt = obj.get('weakness_tag')
+            weakness_tag = str(wt).strip() if (isinstance(wt, str) and wt.strip().lower() not in ('', 'null', 'none')) else None
+            return {'question': q, 'answer': a, 'weakness_tag': weakness_tag}
     except Exception:
         pass
     return None
 
 
-def generate_card(topic: str) -> Tuple[str, str]:
+def generate_card(topic: str, direction: Optional[str] = None) -> Tuple[str, str]:
     """第一层：根据主题让 LLM 出题并生成标准答案。
 
+    direction：可选方向（如 编程语言/MCU），用于约束出题范围。
     返回 (question, answer)；失败时退回 (topic, topic)。
     """
+    direction_text = ''
+    if direction:
+        direction_text = '\n题目方向：' + direction + '（请务必围绕该方向相关的知识点出题）'
     content = chat([
         {'role': 'system', 'content': '你是一名学习教练，负责根据主题出题并给出标准答案。'},
         {'role': 'user', 'content': (
             '围绕下面的主题，出一道适合考察理解程度的简答题，并给出标准答案。\n'
             '严格只输出 JSON，格式：{"question": "<题目>", "answer": "<标准答案>"}\n\n'
-            '主题：' + topic
+            '主题：' + topic + direction_text
         )},
     ], max_tokens=256, temperature=0.7)
 
@@ -233,37 +381,52 @@ def evaluate_answer(question: str, reference: str, user_answer: str) -> Tuple[Op
 _TOPIC_DESC = {
     'c': 'C 语言与数据结构',
     'stm32': '嵌入式软件与微控制器',
-    'mix': '项目源码涉及的综合技术',
+    'mix': '项目经验与专业技能',
 }
 
 
-def generate_interview_question(project_context: str, history_text: str, topic: str, round_no: int, total: int, past_questions: Optional[List[str]] = None, candidate_profile: Optional[str] = None, hardware_context: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """面试官基于项目源码出一道面试题，由易到难。
+def generate_interview_question(project_experience: str, history_text: str, topic: str, round_no: int, total: int, past_questions: Optional[List[str]] = None, professional_skills: Optional[str] = None, mastered: Optional[List[Dict[str, Any]]] = None, failed: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    """面试官基于画像中的项目经验与专业技能出一道面试题，由易到难。
 
+    project_experience：画像中的项目经验文本（项目名 + 技术栈与实现描述）。
+    professional_skills：画像中的专业技能文本（技能分类 + 关键词）。
     past_questions：历史面试问过的题目（含本次已问过的），用于去重、避免热门题过度集中。
-    candidate_profile：候选人技能画像（含熟练度），用于围绕简历技能出题并定难度。
-    hardware_context：项目硬件/芯片/设备清单，用于围绕具体型号与操作逻辑出题。
-    返回 {'question': str, 'reference': str, 'difficulty': 'easy|medium|hard'}；
+    mastered：已答对的题（含知识点），出题时避开这些已掌握知识点。
+    failed：已答错的题（含知识点），出题时围绕这些知识点换个问法重新考察。
+    返回 {'question': str, 'reference': str, 'difficulty': 'easy|medium|hard', 'knowledge_point': str}；
     失败返回 None。
     """
-    topic_desc = _TOPIC_DESC.get(topic, '项目相关知识')
+    topic_desc = _TOPIC_DESC.get(topic, '项目经验与专业技能')
     past_text = ''
     if past_questions:
         past_text = '\n'.join('- ' + q for q in past_questions)
 
-    profile_block = ''
-    if candidate_profile:
-        profile_block = ('=== 候选人简历技能画像（围绕这些技能出题，熟练的可以问更深、掌握的问适中，不要问画像之外的技术）===\n'
-                         + candidate_profile + '\n\n')
+    projects_block = ''
+    if project_experience:
+        projects_block = ('=== 候选人项目经验（围绕项目用到的技术栈与实现细节出题，问候选人实际做过、写进简历的技术）===\n'
+                          + project_experience + '\n\n')
 
-    hardware_block = ''
-    if hardware_context:
-        hardware_block = hardware_context + '\n\n'
+    skills_block = ''
+    if professional_skills:
+        skills_block = ('=== 候选人专业技能（围绕这些技能出题，标注熟练的可以问更深、掌握的问适中，不要问画像之外的技术）===\n'
+                        + professional_skills + '\n\n')
+
+    mastered_block = ''
+    if mastered:
+        m_lines = ['- ' + (str(m.get('knowledge_point') or '').strip() or str(m.get('question') or '').strip()) for m in mastered]
+        mastered_block = ('=== 已掌握知识点（候选人之前面试已答对，务必避开：不要再问这些知识点，也不要问高度相关、换汤不换药的题）===\n'
+                          + '\n'.join(m_lines) + '\n\n')
+
+    failed_block = ''
+    if failed:
+        f_lines = ['- ' + (str(f.get('knowledge_point') or '').strip() or str(f.get('question') or '').strip()) for f in failed]
+        failed_block = ('=== 曾答错知识点（候选人之前面试答错过，可以围绕这些知识点换一个问法/角度重新考察，帮助巩固；务必换角度，不要原题重问）===\n'
+                        + '\n'.join(f_lines) + '\n\n')
 
     content = chat([
-        {'role': 'system', 'content': '你是一名软件工程面试官。请根据提供的项目源码与候选人的技能画像出题，考察技术理解和表达能力。题目难度应由浅入深、知识点尽量多样，并符合候选人的技能水平。'},
+        {'role': 'system', 'content': '你是一名软件工程面试官。请根据候选人的项目经验与专业技能出题，考察技术理解和表达能力。题目难度应由浅入深、知识点尽量多样，并符合候选人的技能水平。'},
         {'role': 'user', 'content': (
-            '下面是候选人项目的源码，仅用于了解项目涉及的技术与实现，供你出题。\n'
+            '下面是候选人的项目经验与专业技能，供你出题。\n'
             '请围绕「' + topic_desc + '」出一道通用技术面试题。\n'
             '要求：\n'
             '1. 题目必须是通用的技术面试题，考察原理、设计思路、方案选择、常见坑等；不要问“你代码里第几行写了什么”，不要引用具体函数名、变量名、宏名。\n'
@@ -277,11 +440,12 @@ def generate_interview_question(project_context: str, history_text: str, topic: 
             '6. 只出一道题，不要一次问多个，不要提示答案。\n'
             '7. 同时给出该题的“技术正确要点”（通用正确知识，仅用于判分参考，不展示给候选人）。\n'
             '8. 【去重与多样性——非常重要】下面会列出“历史问过的题”。请务必换一个新的知识点出题，不要重复、不要换汤不换药地重问同一个知识点（例如已经问过 volatile，就不要再出 const/static/volatile 相关题；已问过波特率就不要再出串口时序类计算）。要尽量覆盖还没问过的技术面，保证知识点分散、问得杂一点、面广一点。\n'
-            '9. 【紧扣技能画像】优先围绕候选人简历上列出的技能出题；标注“熟练”的技能可以问得更深入，标注“掌握”的问适中；不要问画像之外的技术。\n'
-            '严格只输出 JSON，格式：{"question": "<题目>", "reference": "<技术正确要点>", "difficulty": "easy|medium|hard"}\n\n'
-            + profile_block
-            + hardware_block +
-            '=== 候选人项目背景（仅作选题参考）===\n' + project_context + '\n\n'
+            '9. 【紧扣项目经验与专业技能】优先围绕候选人项目经验中用到的技术、以及专业技能中列出的技术出题；问候选人实际做过、写在简历里的技术，不要问画像之外的技术。\n'
+            '严格只输出 JSON，格式：{"question": "<题目>", "reference": "<技术正确要点>", "difficulty": "easy|medium|hard", "knowledge_point": "<本题考察的核心知识点标签，2-8 字，如 volatile、I2C 时序>"}\n\n'
+            + projects_block
+            + skills_block
+            + mastered_block
+            + failed_block +
             '=== 历史问过的题（务必避开，换新知识点）===\n' + (past_text or '（暂无）') + '\n\n'
             '=== 本次已问过的问题与候选人表现 ===\n' + (history_text or '（暂无，这是第一题）')
         )},
@@ -295,10 +459,11 @@ def generate_interview_question(project_context: str, history_text: str, topic: 
         q = str(obj.get('question') or '').strip()
         r = str(obj.get('reference') or '').strip()
         d = str(obj.get('difficulty') or 'easy').strip().lower()
+        kp = str(obj.get('knowledge_point') or '').strip()
         if d not in ('easy', 'medium', 'hard'):
             d = 'easy'
         if q:
-            return {'question': q, 'reference': r, 'difficulty': d}
+            return {'question': q, 'reference': r, 'difficulty': d, 'knowledge_point': kp}
     except Exception:
         pass
     return None

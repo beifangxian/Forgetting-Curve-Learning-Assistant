@@ -47,8 +47,12 @@ def parse_markdown(text: str) -> List[Dict[str, str]]:
     return items
 
 
-def import_markdown_file(path: str, tags: Optional[List[str]] = None, db_path: Optional[str] = None) -> int:
-    """读取 md 文件并导入数据库，返回导入的卡片数。"""
+def import_markdown_file(path: str, tags: Optional[List[str]] = None, subject: Optional[str] = None, direction: Optional[str] = None, db_path: Optional[str] = None) -> int:
+    """读取 md 文件并导入数据库，返回导入的卡片数。
+
+    subject：学科分区（如「英语」「嵌入式」「数学」），为 None 时不归入任何分区。
+    direction：方向（学科下的二级分类，如「编程语言」「MCU」），为 None 时不标记。
+    """
     from . import db
 
     with open(path, 'r', encoding='utf-8') as f:
@@ -64,12 +68,12 @@ def import_markdown_file(path: str, tags: Optional[List[str]] = None, db_path: O
         if it.get('topic'):
             card_tags.append(it['topic'])
         card_tags.append(source_tag)
-        db.add_card(it['question'], it['answer'], [], [], card_tags, db_path)
+        db.add_card(it['question'], it['answer'], [], [], card_tags, subject, direction, db_path)
         count += 1
     return count
 
 
-def sync_markdown_file(path: str, tags: Optional[List[str]] = None, db_path: Optional[str] = None):
+def sync_markdown_file(path: str, tags: Optional[List[str]] = None, subject: Optional[str] = None, direction: Optional[str] = None, db_path: Optional[str] = None):
     """同步 md 文件：更新已有知识点卡（保留学习进度），新增多出的知识点。
 
     匹配规则：来源标签 md:<文件名> 且 `##` 标题文字完全一致。
@@ -99,9 +103,9 @@ def sync_markdown_file(path: str, tags: Optional[List[str]] = None, db_path: Opt
         card_tags.append(source_tag)
         q = it['question']
         if q in by_question:
-            db.update_card(by_question[q]['id'], q, it['answer'], [], [], card_tags, db_path)
+            db.update_card(by_question[q]['id'], q, it['answer'], [], [], card_tags, subject, direction, db_path)
             updated += 1
         else:
-            db.add_card(q, it['answer'], [], [], card_tags, db_path)
+            db.add_card(q, it['answer'], [], [], card_tags, subject, direction, db_path)
             added += 1
     return updated, added
